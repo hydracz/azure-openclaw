@@ -2,6 +2,12 @@
 
 这个目录里的 `azure-openclaw-oneclick.sh` 是一个用于 Azure Cloud Shell 的一键安装脚本，用来快速创建一台运行 OpenClaw 的 Azure VM，并完成基础环境准备。
 
+使用默认配置一键安装
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hydracz/azure-openclaw/refs/heads/main/azure-openclaw-oneclick.sh)
+```
+
 ## 脚本会做什么
 
 脚本默认会完成以下事情：
