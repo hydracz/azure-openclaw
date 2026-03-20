@@ -58,6 +58,7 @@ SUBNET_ADDRESS_PREFIX="${SUBNET_ADDRESS_PREFIX:-10.42.1.0/24}"
 
 CLOUD_INIT_WAIT_SECONDS="${CLOUD_INIT_WAIT_SECONDS:-1800}"
 CLOUD_INIT_POLL_INTERVAL="${CLOUD_INIT_POLL_INTERVAL:-20}"
+STEP_INDEX=0
 
 #######################################
 # Helpers
@@ -65,6 +66,11 @@ CLOUD_INIT_POLL_INTERVAL="${CLOUD_INIT_POLL_INTERVAL:-20}"
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+step() {
+  STEP_INDEX=$((STEP_INDEX + 1))
+  log "Step ${STEP_INDEX}: $*"
 }
 
 fail() {
@@ -787,39 +793,43 @@ ensure_vm() {
 ensure_vm_identity_and_role() {
   az vm identity assign --resource-group "$RG_NAME" --name "$VM_NAME" --output none
 
-  local ai_resource_id assignment_count role_name
+  local ai_resource_id role_name create_output create_rc
   VM_IDENTITY_PRINCIPAL_ID="$(az vm show --resource-group "$RG_NAME" --name "$VM_NAME" --query identity.principalId -o tsv)"
   ai_resource_id="$(az cognitiveservices account show --resource-group "$RG_NAME" --name "$AI_ACCOUNT_NAME" --query id -o tsv)"
 
   for role_name in "$AI_OPENAI_USER_ROLE_NAME" "$AI_DEVELOPER_ROLE_NAME"; do
-    assignment_count="$(az role assignment list \
+    set +e
+    create_output="$(az role assignment create \
       --assignee-object-id "$VM_IDENTITY_PRINCIPAL_ID" \
+      --assignee-principal-type ServicePrincipal \
+      --role "$role_name" \
       --scope "$ai_resource_id" \
-      --query "[?roleDefinitionName=='${role_name}'] | length(@)" \
-      -o tsv)"
+      --output none 2>&1)"
+    create_rc=$?
+    set -e
 
-    if [[ "$assignment_count" == "0" ]]; then
-      az role assignment create \
-        --assignee-object-id "$VM_IDENTITY_PRINCIPAL_ID" \
-        --assignee-principal-type ServicePrincipal \
-        --role "$role_name" \
-        --scope "$ai_resource_id" \
-        --output none
+    if [[ $create_rc -eq 0 ]]; then
+      log "Role assigned: ${role_name}"
+      continue
     fi
+
+    if [[ "$create_output" == *"RoleAssignmentExists"* || "$create_output" == *"role assignment already exists"* ]]; then
+      log "Role already assigned: ${role_name}"
+      continue
+    fi
+
+    printf '%s\n' "$create_output" >&2
+    fail "Failed to assign role '${role_name}' to VM managed identity."
   done
 }
 
 sync_vm_identity_metadata() {
-  local vm_identity_client_id vm_identity_principal_id
+  local vm_identity_principal_id
 
   vm_identity_principal_id="$(az vm show \
     --resource-group "$RG_NAME" \
     --name "$VM_NAME" \
     --query identity.principalId -o tsv)"
-
-  vm_identity_client_id="$(az ad sp show \
-    --id "$vm_identity_principal_id" \
-    --query appId -o tsv 2>/dev/null || true)"
 
   az vm run-command invoke \
     --resource-group "$RG_NAME" \
@@ -828,15 +838,19 @@ sync_vm_identity_metadata() {
     --scripts \
       "ENV_FILE=/home/${ADMIN_USERNAME}/.openclaw/gateway.env" \
       "SUMMARY_FILE=/home/${ADMIN_USERNAME}/openclaw-ready.txt" \
-      "grep -q '^AZURE_CLIENT_ID=' \"\$ENV_FILE\" && sed -i 's/^AZURE_CLIENT_ID=.*/AZURE_CLIENT_ID=${vm_identity_client_id}/' \"\$ENV_FILE\" || printf 'AZURE_CLIENT_ID=${vm_identity_client_id}\\n' >>\"\$ENV_FILE\"" \
+      "IDENTITY_JSON=\$(curl -fsS -H Metadata:true 'http://169.254.169.254/metadata/identity/info?api-version=2019-11-01' 2>/dev/null || true)" \
+      "VM_CLIENT_ID=\$(printf '%s' \"\$IDENTITY_JSON\" | jq -r '.client_id // empty' 2>/dev/null || true)" \
+      "if [ -n \"\$VM_CLIENT_ID\" ]; then grep -q '^AZURE_CLIENT_ID=' \"\$ENV_FILE\" && sed -i \"s/^AZURE_CLIENT_ID=.*/AZURE_CLIENT_ID=\$VM_CLIENT_ID/\" \"\$ENV_FILE\" || printf 'AZURE_CLIENT_ID=%s\\n' \"\$VM_CLIENT_ID\" >>\"\$ENV_FILE\"; fi" \
       "grep -q '^AZURE_PRINCIPAL_ID=' \"\$ENV_FILE\" && sed -i 's/^AZURE_PRINCIPAL_ID=.*/AZURE_PRINCIPAL_ID=${vm_identity_principal_id}/' \"\$ENV_FILE\" || printf 'AZURE_PRINCIPAL_ID=${vm_identity_principal_id}\\n' >>\"\$ENV_FILE\"" \
-      "if [ -f \"\$SUMMARY_FILE\" ]; then sed -i 's/^Managed identity client ID: .*/Managed identity client ID: ${vm_identity_client_id}/' \"\$SUMMARY_FILE\"; sed -i 's/^Managed identity principal ID: .*/Managed identity principal ID: ${vm_identity_principal_id}/' \"\$SUMMARY_FILE\"; fi" \
+      "if [ -f \"\$SUMMARY_FILE\" ]; then if [ -n \"\$VM_CLIENT_ID\" ]; then sed -i \"s/^Managed identity client ID: .*/Managed identity client ID: \$VM_CLIENT_ID/\" \"\$SUMMARY_FILE\"; fi; sed -i 's/^Managed identity principal ID: .*/Managed identity principal ID: ${vm_identity_principal_id}/' \"\$SUMMARY_FILE\"; fi" \
       --output none
 }
 
 wait_for_cloud_init() {
-  local deadline now rc output
+  local deadline start_time now rc output poll_count elapsed
   deadline=$(( $(date +%s) + CLOUD_INIT_WAIT_SECONDS ))
+  start_time=$(date +%s)
+  poll_count=0
 
   while true; do
     now=$(date +%s)
@@ -856,6 +870,12 @@ wait_for_cloud_init() {
 
     if [[ $rc -eq 0 && "$output" == *ready* ]]; then
       return 0
+    fi
+
+    poll_count=$((poll_count + 1))
+    if (( poll_count % 3 == 0 )); then
+      elapsed=$((now - start_time))
+      log "cloud-init still running (${elapsed}s elapsed)."
     fi
 
     sleep "$CLOUD_INIT_POLL_INTERVAL"
@@ -901,8 +921,11 @@ require_cmd base64
 
 az account show >/dev/null 2>&1 || fail "Azure CLI is not logged in. Run az login first."
 
+step "Selecting Azure subscription"
 ensure_subscription
+step "Preparing SSH key"
 ensure_ssh_key
+step "Preparing resource names"
 choose_resource_group_name
 
 RG_NAME="$(sanitize_name "$RG_NAME")"
@@ -921,8 +944,11 @@ PUBLIC_IP_NAME="${PUBLIC_IP_NAME:-pip-${RESOURCE_NAME_SUFFIX}}"
 AI_ACCOUNT_NAME="${AI_ACCOUNT_NAME:-ai${SHORT_BASE}$(random_suffix)}"
 AI_ACCOUNT_NAME="${AI_ACCOUNT_NAME:0:24}"
 
+step "Ensuring resource group"
 ensure_resource_group
+step "Ensuring virtual network, NSG, public IP, and NIC"
 ensure_network
+step "Ensuring Azure AI resource"
 ensure_ai_account
 
 log "Resource group: ${RG_NAME}"
@@ -934,10 +960,15 @@ log "Model deployments are not created by this script. Create them later in Azur
 build_bootstrap_script
 build_cloud_init
 
+step "Ensuring virtual machine"
 ensure_vm
+step "Ensuring VM managed identity and role assignments"
 ensure_vm_identity_and_role
 
 log "Waiting for cloud-init bootstrap to finish. This can take several minutes."
+step "Waiting for VM bootstrap (cloud-init)"
 wait_for_cloud_init
+step "Syncing VM identity metadata"
 sync_vm_identity_metadata
+step "Printing provisioning summary"
 print_summary
