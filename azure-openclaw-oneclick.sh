@@ -107,14 +107,49 @@ sanitize_compact_name() {
 }
 
 ensure_ssh_key() {
-  if [[ -f "$SSH_PUBLIC_KEY_PATH" ]]; then
+  local private_key_path candidate_private_key candidate_public_key
+  private_key_path="${SSH_PUBLIC_KEY_PATH%.pub}"
+
+  if [[ -f "$private_key_path" && -f "$SSH_PUBLIC_KEY_PATH" ]]; then
+    log "Reusing SSH key pair: ${private_key_path}"
     return 0
   fi
 
-  local private_key_path
-  private_key_path="${SSH_PUBLIC_KEY_PATH%.pub}"
+  if [[ -f "$private_key_path" && ! -f "$SSH_PUBLIC_KEY_PATH" ]]; then
+    log "SSH private key found without public key. Rebuilding ${SSH_PUBLIC_KEY_PATH}."
+    ssh-keygen -y -f "$private_key_path" >"$SSH_PUBLIC_KEY_PATH"
+    chmod 644 "$SSH_PUBLIC_KEY_PATH"
+    return 0
+  fi
+
+  for candidate_private_key in \
+    "$HOME/.ssh/id_ed25519" \
+    "$HOME/.ssh/id_ecdsa" \
+    "$HOME/.ssh/id_rsa"
+  do
+    candidate_public_key="${candidate_private_key}.pub"
+
+    if [[ "$candidate_private_key" == "$private_key_path" ]]; then
+      continue
+    fi
+
+    if [[ -f "$candidate_private_key" && -f "$candidate_public_key" ]]; then
+      SSH_PUBLIC_KEY_PATH="$candidate_public_key"
+      log "Reusing SSH key pair: ${candidate_private_key}"
+      return 0
+    fi
+
+    if [[ -f "$candidate_private_key" && ! -f "$candidate_public_key" ]]; then
+      ssh-keygen -y -f "$candidate_private_key" >"$candidate_public_key"
+      chmod 644 "$candidate_public_key"
+      SSH_PUBLIC_KEY_PATH="$candidate_public_key"
+      log "Reusing SSH private key and rebuilt public key: ${candidate_private_key}"
+      return 0
+    fi
+  done
+
   mkdir -p "$(dirname "$private_key_path")"
-  log "SSH public key not found. Generating ${private_key_path}."
+  log "No reusable SSH key pair found. Generating ${private_key_path}."
   ssh-keygen -t ed25519 -N '' -f "$private_key_path" >/dev/null
 }
 
